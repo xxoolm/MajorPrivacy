@@ -12,8 +12,12 @@
 #include "../Library/Helpers/TokenUtil.h"
 #include "../Library/IPC/AbstractClient.h"
 #include <shellapi.h>
+//#include <shlobj.h>
 #include "Helpers/SecDeskHelper.h"
 #include "../Library/IPC/ServerReadyEvent.h"
+
+#include "../library/Helpers/MiniDumpFilter.h"
+#include "../MajorPrivacy/version.h"
 
 #include <windows.h>
 #include <winsock2.h>
@@ -179,11 +183,53 @@ static int RestartSelf(const wchar_t* arg_tag, bool bAsSystem = false)
 	return -1; // Timeout or error
 }
 
+EXTERN_C DECLSPEC_IMPORT HRESULT STDAPICALLTYPE SHGetFolderPathW(_Reserved_ HWND hwnd, _In_ int csidl, _In_opt_ HANDLE hToken, _In_ DWORD dwFlags, _Out_writes_(MAX_PATH) LPWSTR pszPath);
+
+//
+// Close any running MajorPrivacy GUI processes.
+// Used when unloading/removing the service so the GUI does not linger without its backend.
+// A WM_CLOSE would only minimize the GUI to the tray, hence we terminate the processes.
+//
+static void CloseGui()
+{
+    std::vector<BYTE> Processes;
+    if (!NT_SUCCESS(MyQuerySystemInformation(Processes, SystemProcessInformation)))
+        return;
+
+    for (PSYSTEM_PROCESS_INFORMATION process = PH_FIRST_PROCESS(Processes.data()); process != NULL; process = PH_NEXT_PROCESS(process))
+    {
+        if (process->UniqueProcessId == 0 || process->ImageName.Buffer == NULL)
+            continue; // skip Idle Process and entries without a name
+
+        std::wstring Name(process->ImageName.Buffer, process->ImageName.Length / sizeof(wchar_t));
+        if (_wcsicmp(Name.c_str(), APP_NAME L".exe") != 0)
+            continue;
+
+        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)(ULONG_PTR)process->UniqueProcessId);
+        if (hProcess) {
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+        }
+    }
+}
+
 int WinMain(
     HINSTANCE hInstance,
     HINSTANCE hPrevInstance,
     LPSTR lpCmdLine, int nCmdShow)
 {
+	srand((unsigned int)time(NULL));
+
+    if (!IsDebuggerPresent()) {
+        // Dumps go under %ProgramData%\Xanasoft\MajorPrivacy\MiniDump.
+        WCHAR szDumpDir[MAX_PATH] = {0};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, 0x0023/*CSIDL_COMMON_APPDATA*/, NULL, 0, szDumpDir))) {
+            wcscat_s(szDumpDir, MAX_PATH, L"\\Xanasoft\\MajorPrivacy\\MiniDump");
+        }
+        MiniDumpFilter_Init(NULL, L"PrivacyAgent-v" VERSION_WSTR, MDF_TYPE_TRIAGE, NULL,
+                            szDumpDir[0] ? szDumpDir : NULL);
+    }
+
 #ifdef _DEBUG
     MySetThreadDescription(GetCurrentThread(), L"WinMain");
 #endif
@@ -435,6 +481,9 @@ int WinMain(
             if ((SvcState & SVC_RUNNING) == SVC_RUNNING)
                 Status = KillService(API_SERVICE_NAME);
         }
+
+        // The service/driver is going away, so close the GUI as well.
+        CloseGui();
 
         Status = CServiceCore::StopDriver();
 
